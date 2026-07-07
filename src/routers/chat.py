@@ -48,23 +48,6 @@ async def _get_or_create_open_session(db: AsyncSession, client_id: str, ip: Opti
     await db.commit()
     await db.refresh(s)
 
-    r = get_redis()
-    try:
-        await r.publish(
-            "tg.notify",
-            json.dumps(
-                {
-                    "type": "session_started",
-                    "source": "site",
-                    "sessionId": s.id,
-                    "clientId": client_id,
-                },
-                ensure_ascii=False,
-            ),
-        )
-    except Exception:
-        pass
-
     return s
 
 
@@ -329,6 +312,10 @@ async def ws_chat(ws: WebSocket, clientId: str):
     await ws_manager.connect(clientId, ws)
     try:
         while True:
-            await ws.receive()
+            msg = await ws.receive()
+            if msg.get("type") == "websocket.disconnect":
+                break
     except WebSocketDisconnect:
+        pass
+    finally:
         await ws_manager.disconnect(clientId, ws)
