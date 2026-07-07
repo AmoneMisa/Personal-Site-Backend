@@ -7,6 +7,7 @@ RUN apt-get update && apt-get install -y \
   libffi-dev \
   python3-dev \
   ghostscript \
+  fonts-dejavu-core \
   && rm -rf /var/lib/apt/lists/*
 
 

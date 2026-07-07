@@ -6,7 +6,7 @@ import os
 import shutil
 import time
 import uuid
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 from fastapi import APIRouter, UploadFile, File, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
@@ -15,9 +15,13 @@ from pypdf import PdfReader
 from pypdf.generic import NameObject
 from redis.asyncio import Redis
 
+from fastapi.concurrency import run_in_threadpool
+
 from ..processors.pdf_ops import merge_pdfs  # (старый мердж оставляем)
 from ..processors.pdf_ops_new import apply_png_overlays  # (новый рендер поверх)
 from ..processors.pdf_preview import render_pdf_page_to_png
+from ..processors.pdf_text import extract_text_blocks
+from ..processors.pdf_textedit import apply_text_edits
 from ..utils.redis_client import get_redis
 
 try:
@@ -195,9 +199,52 @@ class DraftPutBody(BaseModel):
     draft: Dict[str, Any]
 
 
+class OrigBlockModel(BaseModel):
+    # DPI-independent PDF points (top-left origin) of the original extracted region
+    xPt: Optional[float] = None
+    yPt: Optional[float] = None
+    wPt: Optional[float] = None
+    hPt: Optional[float] = None
+
+    model_config = {"extra": "ignore"}
+
+
+class TextEditBlockModel(BaseModel):
+    text: str = ""
+    # edited block geometry in PDF points (top-left origin)
+    xPt: Optional[float] = None
+    yPt: Optional[float] = None
+    wPt: Optional[float] = None
+    hPt: Optional[float] = None
+    fontSizePt: Optional[float] = None
+    fontName: str = "Helvetica"
+    bold: bool = False
+    italic: bool = False
+    underline: bool = False
+    align: str = "left"
+    color: str = "#111111"
+    opacity: float = 1.0
+    angle: float = 0.0
+    orig: Optional[OrigBlockModel] = None
+
+    model_config = {"extra": "ignore"}
+
+
+class PageSizeModel(BaseModel):
+    widthPt: Optional[float] = None
+    heightPt: Optional[float] = None
+
+    model_config = {"extra": "ignore"}
+
+
 class SaveBody(BaseModel):
-    overlays: Dict[int, str]  # page -> dataURL or base64
+    overlays: Dict[int, str] = {}  # page -> dataURL or base64 (raster drawings)
+    textEdits: Dict[int, List[TextEditBlockModel]] = {}  # page -> edited text blocks
     dpi: int = Field(default=144, ge=72, le=220)
+    page: Optional[PageSizeModel] = None
+    coords: Optional[Dict[str, Any]] = None
+
+    model_config = {"extra": "ignore"}
 
 
 # ----------------------------
@@ -318,6 +365,37 @@ async def preview(doc_id: str, page: int, dpi: int = 144):
     return FileResponse(out_png, media_type="image/png")
 
 
+@router.get("/text-blocks/{doc_id}/{page}")
+async def text_blocks(doc_id: str, page: int, dpi: int = 144):
+    # clamp dpi to match the preview raster the client overlays
+    if dpi < 72:
+        dpi = 72
+    if dpi > 220:
+        dpi = 220
+
+    r: Redis = get_redis()
+    await ensure_doc_exists(r, doc_id)
+
+    src = source_path(doc_id)
+    if not os.path.exists(src):
+        raise HTTPException(404, "Source PDF not found")
+
+    total = _safe_pdf_num_pages(src)
+    if total <= 0:
+        raise HTTPException(500, "Unable to read PDF")
+
+    if page < 1 or page > total:
+        raise HTTPException(400, "Invalid page number")
+
+    try:
+        # extraction is sync CPU/IO work -> keep it off the event loop
+        blocks = await run_in_threadpool(extract_text_blocks, src, page, dpi)
+    except Exception as e:
+        raise HTTPException(500, f"Failed to extract text: {e}")
+
+    return JSONResponse({"blocks": blocks})
+
+
 @router.get("/draft/{doc_id}")
 async def get_draft(doc_id: str):
     r: Redis = get_redis()
@@ -361,10 +439,35 @@ async def save(doc_id: str, body: SaveBody):
         except Exception:
             raise HTTPException(400, f"Bad base64 for page {p}")
 
-    # apply overlays -> result.pdf
+    # collect edited text blocks (page -> list of plain dicts for the processor)
+    text_edits: Dict[int, List[Dict[str, Any]]] = {
+        int(p): [b.model_dump() for b in blocks]
+        for p, blocks in body.textEdits.items()
+        if blocks
+    }
+
     out = result_path(doc_id)
     os.makedirs(doc_folder(doc_id), exist_ok=True)
-    apply_png_overlays(src, out, overlays_bytes, dpi=body.dpi)
+
+    # Render pipeline (heavy sync work -> keep off the event loop):
+    #   1) redact original text + re-typeset edited text (fitz)
+    #   2) stamp raster drawings (pen/shapes/added text) on top (reportlab)
+    def _render() -> None:
+        work_src = src
+        tmp_edit = os.path.join(doc_folder(doc_id), "with_text.pdf")
+        try:
+            if text_edits:
+                apply_text_edits(src, tmp_edit, text_edits)
+                work_src = tmp_edit
+            apply_png_overlays(work_src, out, overlays_bytes, dpi=body.dpi)
+        finally:
+            if work_src != src and os.path.exists(tmp_edit):
+                try:
+                    os.remove(tmp_edit)
+                except Exception:
+                    pass
+
+    await run_in_threadpool(_render)
 
     # result TTL
     expires_result = now_ts() + RESULT_TTL_SECONDS
