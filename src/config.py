@@ -19,7 +19,7 @@ class Settings(BaseSettings):
         f"mysql+aiomysql://{self.MARIADB_USER}:{self.MARIADB_PASSWORD}" f"@{self.DB_HOST}:{self.DB_PORT}/{self.MARIADB_DATABASE}")
 
     class Config:
-        env_file = "db.env"
+        env_file = ".env"
 
 
 settings = Settings()
