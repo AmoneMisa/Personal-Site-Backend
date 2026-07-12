@@ -20,6 +20,11 @@ from ..utils.translation_tree import build_tree
 
 router = APIRouter(prefix="/translations", tags=["Translations"])
 
+# Per-language cache under keys `translations:{code}`. Every write path already
+# deletes these keys, so read-through caching here is safe; the TTL is only a
+# backstop in case an invalidation is ever missed.
+TRANSLATIONS_CACHE_TTL = 3600
+
 
 # ---------------------------------------------------------
 # Unified API error helper
@@ -60,47 +65,65 @@ async def get_translations(
         lang: str | None = None,
         session: AsyncSession = Depends(get_session),
 ):
-    # Если указан конкретный язык → вернуть только его
+    redis = get_redis()
+
+    def _parse(raw):
+        try:
+            return json.loads(raw)
+        except Exception:
+            return raw
+
+    async def _lang_maps_from_db(codes: list[str]) -> dict[str, dict]:
+        # Собрать {code: {key: value}} для указанных языков одним запросом (без N+1).
+        out: dict[str, dict] = {c: {} for c in codes}
+        if not codes:
+            return out
+        rows = await session.execute(
+            select(Language.code, TranslationKey.key, TranslationValue.value)
+            .join(TranslationKey, TranslationKey.id == TranslationValue.translationKeyId)
+            .join(Language, Language.id == TranslationValue.languageId)
+            .where(Language.code.in_(codes))
+        )
+        for code, key_name, raw in rows.all():
+            out.setdefault(code, {})[key_name] = _parse(raw)
+        return out
+
+    # Если указан конкретный язык → вернуть только его (через кэш)
     if lang:
-        values = await session.execute(
-            select(TranslationValue, TranslationKey)
-            .join(TranslationKey, TranslationKey.id == TranslationValue.translationKeyId)
-            .join(Language, Language.id == TranslationValue.languageId)
-            .where(Language.code == lang)
+        cached = await redis.get(f"translations:{lang}")
+        if cached is not None:
+            return json.loads(cached)
+
+        result_map = (await _lang_maps_from_db([lang])).get(lang, {})
+        await redis.set(
+            f"translations:{lang}",
+            json.dumps(result_map, ensure_ascii=False),
+            ex=TRANSLATIONS_CACHE_TTL,
         )
+        return result_map
 
-        result: dict[str, Union[str, int, float, list, dict]] = {}
-        for value, key_obj in values.all():
-            try:
-                parsed = json.loads(value.value)
-                result[key_obj.key] = parsed
-            except Exception:
-                result[key_obj.key] = value.value
-        return result
-
-    # Если язык НЕ указан → вернуть ВСЕ языки
-    languages = await session.execute(select(Language))
-    languages = [l[0].code for l in languages.all()]
-
+    # Если язык НЕ указан → собрать все языки, предпочитая кэш
+    codes = (await session.scalars(select(Language.code))).all()
     result: dict[str, dict[str, Union[str, int, float, list, dict]]] = {}
+    missing: list[str] = []
 
-    for code in languages:
-        values = await session.execute(
-            select(TranslationValue, TranslationKey)
-            .join(TranslationKey, TranslationKey.id == TranslationValue.translationKeyId)
-            .join(Language, Language.id == TranslationValue.languageId)
-            .where(Language.code == code)
-        )
+    if codes:
+        cached_values = await redis.mget([f"translations:{c}" for c in codes])
+        for code, cached in zip(codes, cached_values):
+            if cached is not None:
+                result[code] = json.loads(cached)
+            else:
+                missing.append(code)
 
-        lang_map: dict[str, Union[str, int, float, list, dict]] = {}
-        for value, key_obj in values.all():
-            try:
-                parsed = json.loads(value.value)
-                lang_map[key_obj.key] = parsed
-            except Exception:
-                lang_map[key_obj.key] = value.value
-
-        result[code] = lang_map
+    if missing:
+        fresh = await _lang_maps_from_db(missing)
+        for code in missing:
+            result[code] = fresh.get(code, {})
+            await redis.set(
+                f"translations:{code}",
+                json.dumps(result[code], ensure_ascii=False),
+                ex=TRANSLATIONS_CACHE_TTL,
+            )
 
     # Если указан key → вернуть только его
     if key:
