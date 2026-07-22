@@ -20,6 +20,7 @@ from fastapi.concurrency import run_in_threadpool
 from ..processors.pdf_ops import merge_pdfs  # (старый мердж оставляем)
 from ..processors.pdf_ops_new import apply_png_overlays  # (новый рендер поверх)
 from ..processors.pdf_preview import render_pdf_page_to_png
+from ..processors.pdf_background import render_background_png
 from ..processors.pdf_text import extract_text_blocks, extract_links
 from ..processors.pdf_textedit import apply_text_edits, apply_links
 from ..processors.pdf_image import extract_images, apply_image_edits
@@ -395,6 +396,44 @@ async def preview(doc_id: str, page: int, dpi: int = 144):
         raise HTTPException(400, str(e))
     except Exception as e:
         raise HTTPException(500, f"Failed to render preview: {e}")
+
+    return FileResponse(out_png, media_type="image/png")
+
+
+@router.get("/background/{doc_id}/{page}")
+async def background(doc_id: str, page: int, dpi: int = 144):
+    # clamp dpi to match the preview raster the client overlays
+    if dpi < 72:
+        dpi = 72
+    if dpi > 220:
+        dpi = 220
+
+    r: Redis = get_redis()
+    await ensure_doc_exists(r, doc_id)
+
+    src = source_path(doc_id)
+    if not os.path.exists(src):
+        raise HTTPException(404, "Source PDF not found")
+
+    total = _safe_pdf_num_pages(src)
+    if total <= 0:
+        raise HTTPException(500, "Unable to read PDF")
+
+    if page < 1 or page > total:
+        raise HTTPException(400, "Invalid page number")
+
+    os.makedirs(preview_folder(doc_id), exist_ok=True)
+    out_png = os.path.join(preview_folder(doc_id), f"bg_p{page}_dpi{dpi}.png")
+
+    if os.path.exists(out_png):
+        return FileResponse(out_png, media_type="image/png")
+
+    try:
+        await run_in_threadpool(render_background_png, src, out_png, page, dpi)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"Failed to render background: {e}")
 
     return FileResponse(out_png, media_type="image/png")
 
