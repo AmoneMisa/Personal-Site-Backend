@@ -20,8 +20,9 @@ from fastapi.concurrency import run_in_threadpool
 from ..processors.pdf_ops import merge_pdfs  # (старый мердж оставляем)
 from ..processors.pdf_ops_new import apply_png_overlays  # (новый рендер поверх)
 from ..processors.pdf_preview import render_pdf_page_to_png
-from ..processors.pdf_text import extract_text_blocks
-from ..processors.pdf_textedit import apply_text_edits
+from ..processors.pdf_text import extract_text_blocks, extract_links
+from ..processors.pdf_textedit import apply_text_edits, apply_links
+from ..processors.pdf_image import extract_images, apply_image_edits
 from ..utils.redis_client import get_redis
 
 try:
@@ -73,6 +74,10 @@ def preview_folder(doc_id: str) -> str:
 
 def preview_path(doc_id: str, page: int, dpi: int) -> str:
     return os.path.join(preview_folder(doc_id), f"p{page}_dpi{dpi}.png")
+
+
+def extracted_folder(doc_id: str) -> str:
+    return os.path.join(doc_folder(doc_id), "extracted")
 
 
 def safe_filename(name: str, fallback: str) -> str:
@@ -237,9 +242,38 @@ class PageSizeModel(BaseModel):
     model_config = {"extra": "ignore"}
 
 
+class LinkModel(BaseModel):
+    # clickable region geometry in PDF points (top-left origin) + target URI
+    xPt: Optional[float] = None
+    yPt: Optional[float] = None
+    wPt: Optional[float] = None
+    hPt: Optional[float] = None
+    uri: str = ""
+
+    model_config = {"extra": "ignore"}
+
+
+class ImageEditModel(BaseModel):
+    # which extracted image file this edit refers to
+    name: str = ""
+    # new placement in PDF points (top-left origin, unrotated box) + rotation
+    xPt: Optional[float] = None
+    yPt: Optional[float] = None
+    wPt: Optional[float] = None
+    hPt: Optional[float] = None
+    angle: float = 0.0
+    deleted: bool = False
+    # original extracted region to clear (redact) from the source
+    orig: Optional[OrigBlockModel] = None
+
+    model_config = {"extra": "ignore"}
+
+
 class SaveBody(BaseModel):
     overlays: Dict[int, str] = {}  # page -> dataURL or base64 (raster drawings)
     textEdits: Dict[int, List[TextEditBlockModel]] = {}  # page -> edited text blocks
+    imageEdits: Dict[int, List[ImageEditModel]] = {}  # page -> moved/resized/deleted images
+    links: Dict[int, List[LinkModel]] = {}  # page -> clickable link regions
     dpi: int = Field(default=144, ge=72, le=220)
     page: Optional[PageSizeModel] = None
     coords: Optional[Dict[str, Any]] = None
@@ -390,10 +424,35 @@ async def text_blocks(doc_id: str, page: int, dpi: int = 144):
     try:
         # extraction is sync CPU/IO work -> keep it off the event loop
         blocks = await run_in_threadpool(extract_text_blocks, src, page, dpi)
+        links = await run_in_threadpool(extract_links, src, page, dpi)
+        raw_images = await run_in_threadpool(extract_images, src, page, dpi, extracted_folder(doc_id))
     except Exception as e:
         raise HTTPException(500, f"Failed to extract text: {e}")
 
-    return JSONResponse({"blocks": blocks})
+    # expose extracted image files via the image-serving route
+    images = [
+        {**img, "url": f"/pdf/image/{doc_id}/{img['name']}"}
+        for img in raw_images
+        if img.get("name")
+    ]
+
+    return JSONResponse({"blocks": blocks, "links": links, "images": images})
+
+
+@router.get("/image/{doc_id}/{name}")
+async def get_extracted_image(doc_id: str, name: str):
+    r: Redis = get_redis()
+    await ensure_doc_exists(r, doc_id)
+
+    safe = os.path.basename(name or "")
+    if not safe:
+        raise HTTPException(404, "Image not found")
+
+    path = os.path.join(extracted_folder(doc_id), safe)
+    if not os.path.exists(path):
+        raise HTTPException(404, "Image not found")
+
+    return FileResponse(path, media_type="image/png")
 
 
 @router.get("/draft/{doc_id}")
@@ -446,26 +505,54 @@ async def save(doc_id: str, body: SaveBody):
         if blocks
     }
 
+    # collect moved/resized/rotated/deleted original images (page -> list of dicts)
+    image_edits: Dict[int, List[Dict[str, Any]]] = {
+        int(p): [e.model_dump() for e in edits if e.name]
+        for p, edits in body.imageEdits.items()
+        if edits
+    }
+
+    # collect clickable link regions (page -> list of {xPt,yPt,wPt,hPt,uri})
+    links: Dict[int, List[Dict[str, Any]]] = {
+        int(p): [ln.model_dump() for ln in page_links if ln.uri]
+        for p, page_links in body.links.items()
+        if page_links
+    }
+
     out = result_path(doc_id)
     os.makedirs(doc_folder(doc_id), exist_ok=True)
 
     # Render pipeline (heavy sync work -> keep off the event loop):
     #   1) redact original text + re-typeset edited text (fitz)
-    #   2) stamp raster drawings (pen/shapes/added text) on top (reportlab)
+    #   2) redact moved/deleted original images + re-insert them (fitz)
+    #   3) stamp raster drawings (pen/shapes/added text) on top (reportlab)
+    #   4) attach URI link annotations on the final PDF (fitz)
     def _render() -> None:
         work_src = src
-        tmp_edit = os.path.join(doc_folder(doc_id), "with_text.pdf")
+        tmp_text = os.path.join(doc_folder(doc_id), "with_text.pdf")
+        tmp_img = os.path.join(doc_folder(doc_id), "with_images.pdf")
+        tmps: List[str] = []
         try:
             if text_edits:
-                apply_text_edits(src, tmp_edit, text_edits)
-                work_src = tmp_edit
+                apply_text_edits(work_src, tmp_text, text_edits)
+                work_src = tmp_text
+                tmps.append(tmp_text)
+            if image_edits:
+                apply_image_edits(work_src, tmp_img, image_edits, extracted_folder(doc_id))
+                work_src = tmp_img
+                tmps.append(tmp_img)
             apply_png_overlays(work_src, out, overlays_bytes, dpi=body.dpi)
         finally:
-            if work_src != src and os.path.exists(tmp_edit):
-                try:
-                    os.remove(tmp_edit)
-                except Exception:
-                    pass
+            for tp in tmps:
+                if os.path.exists(tp):
+                    try:
+                        os.remove(tp)
+                    except Exception:
+                        pass
+
+        # links are added last so they survive all prior stages
+        if links:
+            apply_links(out, out, links)
 
     await run_in_threadpool(_render)
 

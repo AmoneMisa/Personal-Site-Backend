@@ -201,3 +201,41 @@ def apply_text_edits(src_pdf: str, out_pdf: str, text_edits: Dict[int, List[Dict
         doc.save(out_pdf, garbage=3, deflate=True)
     finally:
         doc.close()
+
+
+def apply_links(src_pdf: str, out_pdf: str, links: Dict[int, List[Dict[str, Any]]]) -> None:
+    """
+    Attach clickable URI link annotations to an already-rendered PDF.
+
+    Runs as the final save stage (after raster overlays) so the annotations are
+    not stripped by earlier passes. Geometry is the frontend's DPI-independent
+    PDF points (`*Pt`, top-left origin), matching PyMuPDF's coordinate system.
+    Editing `src_pdf == out_pdf` in place is supported.
+    """
+    tmp = f"{out_pdf}.links.tmp"
+    doc = fitz.open(src_pdf)
+    try:
+        for page_no, page_links in links.items():
+            if not page_links:
+                continue
+            idx = int(page_no) - 1
+            if idx < 0 or idx >= doc.page_count:
+                continue
+
+            page = doc.load_page(idx)
+            for ln in page_links:
+                uri = str(ln.get("uri") or "").strip()
+                x, y, w, h = ln.get("xPt"), ln.get("yPt"), ln.get("wPt"), ln.get("hPt")
+                if not uri or None in (x, y, w, h):
+                    continue
+                if w <= 0 or h <= 0:
+                    continue
+                rect = fitz.Rect(x, y, x + w, y + h)
+                page.insert_link({"kind": fitz.LINK_URI, "from": rect, "uri": uri})
+
+        # save to a temp file and swap, so in-place (src == out) saves are safe
+        doc.save(tmp, garbage=3, deflate=True)
+    finally:
+        doc.close()
+
+    os.replace(tmp, out_pdf)
