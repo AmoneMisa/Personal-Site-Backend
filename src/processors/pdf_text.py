@@ -56,6 +56,53 @@ def _merge_counter(dst: Dict[Any, float], src: Dict[Any, float]) -> None:
         dst[k] = dst.get(k, 0.0) + v
 
 
+def _counters_from_lines(lines: List[Dict[str, Any]]):
+    """Rebuild the char-weighted style tallies for a subset of a block's lines
+    (used after re-splitting a merged block into uniform-pitch pieces)."""
+    size_w: Dict[float, float] = {}
+    font_w: Dict[str, float] = {}
+    bold_w: Dict[bool, float] = {}
+    italic_w: Dict[bool, float] = {}
+    color_w: Dict[str, float] = {}
+    for ln in lines:
+        for run in ln["runs"]:
+            w = float(run["n"]) or 1.0
+            size_w[run["size"]] = size_w.get(run["size"], 0.0) + w
+            font_w[run["font"]] = font_w.get(run["font"], 0.0) + w
+            bold_w[run["bold"]] = bold_w.get(run["bold"], 0.0) + w
+            italic_w[run["italic"]] = italic_w.get(run["italic"], 0.0) + w
+            color_w[run["color"]] = color_w.get(run["color"], 0.0) + w
+    return size_w, font_w, bold_w, italic_w, color_w
+
+
+def _split_uniform_pitch(lines: List[Dict[str, Any]], dom_size: float) -> List[List[Dict[str, Any]]]:
+    """Split baseline-sorted lines into contiguous groups whose row-to-row
+    pitch is uniform. Fabric renders a block with a single lineHeight, so a
+    block whose internal spacing changes (e.g. a tight run of skills followed
+    by a looser gap) can only be placed pixel-exact if it is broken where the
+    pitch changes. A new group starts where the gap to the previous row differs
+    from the group's established pitch by more than a quarter of the font."""
+    ordered = sorted(lines, key=lambda ln: ln["y0"])
+    tol = max(1.0, 0.25 * dom_size)
+    groups: List[List[Dict[str, Any]]] = []
+    pitch: float | None = None
+    for ln in ordered:
+        if not groups:
+            groups.append([ln])
+            pitch = None
+            continue
+        gap = ln["y0"] - groups[-1][-1]["y0"]
+        if pitch is None:
+            groups[-1].append(ln)
+            pitch = gap
+        elif abs(gap - pitch) <= tol:
+            groups[-1].append(ln)
+        else:
+            groups.append([ln])
+            pitch = None
+    return groups
+
+
 # Paragraph-merge tolerances, all in unscaled PDF points.
 _COL_TOL = 3.0        # max left-edge drift for two lines to share a column
 _SIZE_TOL = 1.5       # max font-size difference to treat lines as one paragraph
@@ -203,75 +250,99 @@ def extract_text_blocks(src_pdf: str, page: int, dpi: int = 144) -> List[Dict[st
             # one raw record per column: its rows stacked as lines with per-span
             # style runs, plus char-weighted style tallies for the dominant look.
             for col in sorted(columns, key=lambda c: c["x0"]):
-                lines: List[Dict[str, Any]] = []
-                cx0 = cy0 = float("inf")
-                cx1 = cy1 = float("-inf")
-                size_w: Dict[float, float] = {}
-                font_w: Dict[str, float] = {}
-                bold_w: Dict[bool, float] = {}
-                italic_w: Dict[bool, float] = {}
-                color_w: Dict[str, float] = {}
+                # split a column's stacked rows into groups wherever the font
+                # size jumps, so a big title line and its smaller subtitle become
+                # separate blocks (each rendered at its own size) instead of one
+                # block collapsed to the char-weighted dominant size.
+                seg_groups: List[List[Dict[str, Any]]] = []
+                prev_size = None
                 for seg in sorted(col["segs"], key=lambda g: g["y0"]):
-                    cur = ""
-                    runs: List[Dict[str, Any]] = []
-                    prev_x1 = None
-                    for s in sorted(seg["spans"], key=lambda s: s["x0"]):
-                        piece = s["text"]
-                        # bridge an ordinary word-space gap between merged pieces
-                        if (
-                            prev_x1 is not None
-                            and s["x0"] - prev_x1 > 0.3 * s["size"]
-                            and not cur.endswith(" ")
-                            and not piece.startswith(" ")
-                        ):
-                            cur += " "
-                            runs.append({"n": 1, "bold": s["bold"], "italic": s["italic"],
+                    seg_size = max(s["size"] for s in seg["spans"])
+                    if seg_groups and prev_size is not None and abs(seg_size - prev_size) > _SIZE_TOL:
+                        seg_groups.append([seg])
+                    elif seg_groups:
+                        seg_groups[-1].append(seg)
+                    else:
+                        seg_groups.append([seg])
+                    prev_size = seg_size
+
+                for seg_group in seg_groups:
+                    lines: List[Dict[str, Any]] = []
+                    cx0 = cy0 = float("inf")
+                    cx1 = cy1 = float("-inf")
+                    size_w: Dict[float, float] = {}
+                    font_w: Dict[str, float] = {}
+                    bold_w: Dict[bool, float] = {}
+                    italic_w: Dict[bool, float] = {}
+                    color_w: Dict[str, float] = {}
+                    for seg in seg_group:
+                        cur = ""
+                        runs: List[Dict[str, Any]] = []
+                        prev_x1 = None
+                        for s in sorted(seg["spans"], key=lambda s: s["x0"]):
+                            piece = s["text"]
+                            # bridge an ordinary word-space gap between merged pieces
+                            if (
+                                prev_x1 is not None
+                                and s["x0"] - prev_x1 > 0.3 * s["size"]
+                                and not cur.endswith(" ")
+                                and not piece.startswith(" ")
+                            ):
+                                cur += " "
+                                runs.append({"n": 1, "bold": s["bold"], "italic": s["italic"],
+                                             "color": s["color"], "size": s["size"], "font": s["font"]})
+                            cur += piece
+                            runs.append({"n": len(piece), "bold": s["bold"], "italic": s["italic"],
                                          "color": s["color"], "size": s["size"], "font": s["font"]})
-                        cur += piece
-                        runs.append({"n": len(piece), "bold": s["bold"], "italic": s["italic"],
-                                     "color": s["color"], "size": s["size"], "font": s["font"]})
-                        prev_x1 = s["x1"]
+                            prev_x1 = s["x1"]
 
-                        cx0 = min(cx0, s["x0"])
-                        cx1 = max(cx1, s["x1"])
-                        cy0 = min(cy0, seg["y0"])
-                        cy1 = max(cy1, seg["y1"])
-                        w = float(len(s["text"].strip())) or 1.0
-                        size_w[s["size"]] = size_w.get(s["size"], 0.0) + w
-                        font_w[s["font"]] = font_w.get(s["font"], 0.0) + w
-                        bold_w[s["bold"]] = bold_w.get(s["bold"], 0.0) + w
-                        italic_w[s["italic"]] = italic_w.get(s["italic"], 0.0) + w
-                        color_w[s["color"]] = color_w.get(s["color"], 0.0) + w
+                            cx0 = min(cx0, s["x0"])
+                            cx1 = max(cx1, s["x1"])
+                            cy0 = min(cy0, seg["y0"])
+                            cy1 = max(cy1, seg["y1"])
+                            w = float(len(s["text"].strip())) or 1.0
+                            size_w[s["size"]] = size_w.get(s["size"], 0.0) + w
+                            font_w[s["font"]] = font_w.get(s["font"], 0.0) + w
+                            bold_w[s["bold"]] = bold_w.get(s["bold"], 0.0) + w
+                            italic_w[s["italic"]] = italic_w.get(s["italic"], 0.0) + w
+                            color_w[s["color"]] = color_w.get(s["color"], 0.0) + w
 
-                    # rstrip trailing whitespace, trimming run lengths to stay aligned
-                    trim = len(cur) - len(cur.rstrip())
-                    cur = cur.rstrip()
-                    while trim > 0 and runs:
-                        if runs[-1]["n"] <= trim:
-                            trim -= runs.pop()["n"]
-                        else:
-                            runs[-1]["n"] -= trim
-                            trim = 0
-                    if cur:
-                        lines.append({"text": cur, "runs": runs, "y0": seg["y0"]})
+                        # rstrip trailing whitespace, trimming run lengths to stay aligned
+                        trim = len(cur) - len(cur.rstrip())
+                        cur = cur.rstrip()
+                        while trim > 0 and runs:
+                            if runs[-1]["n"] <= trim:
+                                trim -= runs.pop()["n"]
+                            else:
+                                runs[-1]["n"] -= trim
+                                trim = 0
+                        if cur:
+                            lines.append({
+                                "text": cur,
+                                "runs": runs,
+                                "y0": seg["y0"],
+                                "y1": seg["y1"],
+                                "x0": min(s["x0"] for s in seg["spans"]),
+                                "x1": max(s["x1"] for s in seg["spans"]),
+                            })
 
-                if not lines or cx0 == float("inf"):
-                    continue
+                    if not lines or cx0 == float("inf"):
+                        continue
 
-                raw.append(
-                    {
-                        "lines": lines,
-                        "x0": cx0,
-                        "y0": cy0,
-                        "x1": cx1,
-                        "y1": cy1,
-                        "size_w": size_w,
-                        "font_w": font_w,
-                        "bold_w": bold_w,
-                        "italic_w": italic_w,
-                        "color_w": color_w,
-                    }
-                )
+                    raw.append(
+                        {
+                            "lines": lines,
+                            "x0": cx0,
+                            "y0": cy0,
+                            "x1": cx1,
+                            "y1": cy1,
+                            "size_w": size_w,
+                            "font_w": font_w,
+                            "bold_w": bold_w,
+                            "italic_w": italic_w,
+                            "color_w": color_w,
+                        }
+                    )
 
         # Phase 2: stitch stacked lines back into paragraphs. Two records join
         # when they share a left edge and font size and the vertical gap between
@@ -315,59 +386,74 @@ def extract_text_blocks(src_pdf: str, page: int, dpi: int = 144) -> List[Dict[st
             _merge_counter(target["color_w"], r["color_w"])
 
         blocks: List[Dict[str, Any]] = []
-        for seq, p in enumerate(merged):
-            lines = p["lines"]
-            text = "\n".join(ln["text"] for ln in lines)
-            if not text.strip():
-                continue
-
-            # true line pitch from the real baselines: the median gap between
-            # consecutive rows divided by the font size. Emitting this lets the
-            # editor space stacked lines exactly like the source (so overlaid
-            # text keeps aligning with background bullets/rules) instead of
-            # estimating from the bbox height.
+        seq = 0
+        for p in merged:
+            # A Fabric block is stacked with one uniform lineHeight, so break a
+            # merged paragraph wherever its row pitch changes and emit each
+            # uniform-pitch run as its own block. This lets every line land at
+            # its exact source position (pixel-perfect overlay) instead of
+            # drifting when a block mixes tight and loose spacing.
             dom_size = float(_dominant(p["size_w"]) or 12.0)
-            ys = sorted(float(ln["y0"]) for ln in lines)
-            deltas = [b - a for a, b in zip(ys, ys[1:]) if b - a > 0.1]
-            line_height = None
-            if deltas and dom_size > 0:
-                deltas.sort()
-                median = deltas[len(deltas) // 2]
-                line_height = round(median / dom_size, 3)
-            # per-line, per-span style runs so the frontend can rebuild Fabric's
-            # styles[line][char] map (bold surname next to a regular one, a bold
-            # word inside a sentence, an italic role line, etc.).
-            line_runs = [
-                [
-                    {
-                        "n": int(run["n"]),
-                        "bold": bool(run["bold"]),
-                        "italic": bool(run["italic"]),
-                        "color": run["color"],
-                        "fontSize": round(float(run["size"]) * scale, 2),
-                        "fontName": run["font"],
-                    }
-                    for run in ln["runs"]
+            for group in _split_uniform_pitch(p["lines"], dom_size):
+                text = "\n".join(ln["text"] for ln in group)
+                if not text.strip():
+                    continue
+
+                size_w, font_w, bold_w, italic_w, color_w = _counters_from_lines(group)
+                gx0 = min(ln["x0"] for ln in group)
+                gy0 = min(ln["y0"] for ln in group)
+                gx1 = max(ln["x1"] for ln in group)
+                gy1 = max(ln["y1"] for ln in group)
+                g_dom_size = float(_dominant(size_w) or 12.0)
+
+                # true line pitch from the real baselines: the median gap
+                # between consecutive rows divided by the font size. Emitting
+                # this lets the editor space stacked lines exactly like the
+                # source instead of estimating from the bbox height.
+                ys = sorted(float(ln["y0"]) for ln in group)
+                deltas = [b - a for a, b in zip(ys, ys[1:]) if b - a > 0.1]
+                line_height = None
+                if deltas and g_dom_size > 0:
+                    deltas.sort()
+                    median = deltas[len(deltas) // 2]
+                    line_height = round(median / g_dom_size, 3)
+
+                # per-line, per-span style runs so the frontend can rebuild
+                # Fabric's styles[line][char] map (bold surname next to a
+                # regular one, a bold word inside a sentence, an italic role
+                # line, etc.).
+                line_runs = [
+                    [
+                        {
+                            "n": int(run["n"]),
+                            "bold": bool(run["bold"]),
+                            "italic": bool(run["italic"]),
+                            "color": run["color"],
+                            "fontSize": round(float(run["size"]) * scale, 2),
+                            "fontName": run["font"],
+                        }
+                        for run in ln["runs"]
+                    ]
+                    for ln in group
                 ]
-                for ln in lines
-            ]
-            blocks.append(
-                {
-                    "id": f"blk_{page}_{seq}",
-                    "x": round(p["x0"] * scale, 2),
-                    "y": round(p["y0"] * scale, 2),
-                    "w": round((p["x1"] - p["x0"]) * scale, 2),
-                    "h": round((p["y1"] - p["y0"]) * scale, 2),
-                    "text": text,
-                    "fontSize": round(float(_dominant(p["size_w"]) or 12.0) * scale, 2),
-                    "fontName": str(_dominant(p["font_w"]) or "Helvetica"),
-                    "bold": bool(_dominant(p["bold_w"]) or False),
-                    "italic": bool(_dominant(p["italic_w"]) or False),
-                    "color": str(_dominant(p["color_w"]) or "#111111"),
-                    "lineRuns": line_runs,
-                    **({"lineHeight": line_height} if line_height else {}),
-                }
-            )
+                blocks.append(
+                    {
+                        "id": f"blk_{page}_{seq}",
+                        "x": round(gx0 * scale, 2),
+                        "y": round(gy0 * scale, 2),
+                        "w": round((gx1 - gx0) * scale, 2),
+                        "h": round((gy1 - gy0) * scale, 2),
+                        "text": text,
+                        "fontSize": round(g_dom_size * scale, 2),
+                        "fontName": str(_dominant(font_w) or "Helvetica"),
+                        "bold": bool(_dominant(bold_w) or False),
+                        "italic": bool(_dominant(italic_w) or False),
+                        "color": str(_dominant(color_w) or "#111111"),
+                        "lineRuns": line_runs,
+                        **({"lineHeight": line_height} if line_height else {}),
+                    }
+                )
+                seq += 1
 
         return blocks
     finally:
