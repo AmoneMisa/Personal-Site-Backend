@@ -253,7 +253,7 @@ def extract_text_blocks(src_pdf: str, page: int, dpi: int = 144) -> List[Dict[st
                             runs[-1]["n"] -= trim
                             trim = 0
                     if cur:
-                        lines.append({"text": cur, "runs": runs})
+                        lines.append({"text": cur, "runs": runs, "y0": seg["y0"]})
 
                 if not lines or cx0 == float("inf"):
                     continue
@@ -320,6 +320,20 @@ def extract_text_blocks(src_pdf: str, page: int, dpi: int = 144) -> List[Dict[st
             text = "\n".join(ln["text"] for ln in lines)
             if not text.strip():
                 continue
+
+            # true line pitch from the real baselines: the median gap between
+            # consecutive rows divided by the font size. Emitting this lets the
+            # editor space stacked lines exactly like the source (so overlaid
+            # text keeps aligning with background bullets/rules) instead of
+            # estimating from the bbox height.
+            dom_size = float(_dominant(p["size_w"]) or 12.0)
+            ys = sorted(float(ln["y0"]) for ln in lines)
+            deltas = [b - a for a, b in zip(ys, ys[1:]) if b - a > 0.1]
+            line_height = None
+            if deltas and dom_size > 0:
+                deltas.sort()
+                median = deltas[len(deltas) // 2]
+                line_height = round(median / dom_size, 3)
             # per-line, per-span style runs so the frontend can rebuild Fabric's
             # styles[line][char] map (bold surname next to a regular one, a bold
             # word inside a sentence, an italic role line, etc.).
@@ -351,6 +365,7 @@ def extract_text_blocks(src_pdf: str, page: int, dpi: int = 144) -> List[Dict[st
                     "italic": bool(_dominant(p["italic_w"]) or False),
                     "color": str(_dominant(p["color_w"]) or "#111111"),
                     "lineRuns": line_runs,
+                    **({"lineHeight": line_height} if line_height else {}),
                 }
             )
 
