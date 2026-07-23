@@ -108,7 +108,7 @@ _COL_TOL = 3.0        # max left-edge drift for two lines to share a column
 _SIZE_TOL = 1.5       # max font-size difference to treat lines as one paragraph
 _GAP_FACTOR = 0.8     # max blank vertical gap as a fraction of the line's size
 _OVERLAP_FACTOR = 0.4  # allow slight bbox overlap between stacked lines
-_COL_GAP_FACTOR = 4.0  # horizontal gap (in font sizes) that marks a column break
+_COL_GAP_FACTOR = 2.5  # horizontal gap (in font sizes) that marks a column break
 
 
 def extract_text_blocks(src_pdf: str, page: int, dpi: int = 144) -> List[Dict[str, Any]]:
