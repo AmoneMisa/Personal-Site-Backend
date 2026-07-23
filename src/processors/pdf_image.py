@@ -8,9 +8,88 @@ from typing import Any, Dict, List
 import fitz  # PyMuPDF (pulled in transitively by pdf2docx)
 
 try:
-    from PIL import Image  # Pillow (declared in requirements)
+    from PIL import Image, ImageDraw  # Pillow (declared in requirements)
 except Exception:  # pragma: no cover - Pillow is expected in the runtime image
     Image = None  # type: ignore
+    ImageDraw = None  # type: ignore
+
+
+def _detect_circular_clip(page: "fitz.Page", bbox) -> tuple | None:
+    """
+    If an image placement is clipped to a circle/ellipse in the PDF, return that
+    clip as fractions of the image bbox: (cx, cy, rx, ry) each in 0..1.
+
+    Design tools (Canva/Figma/Word) round a photo with a vector clip path made of
+    Bézier curves rather than baking roundness into the raster, so the extracted
+    image is a full rectangle. We recover the intended shape by matching a curved
+    clip that is concentric with the placement and no larger than it (which also
+    excludes the surrounding ring, a wider concentric circle). Fractions keep the
+    result independent of DPI / display scale.
+    """
+    ix0, iy0, ix1, iy1 = bbox
+    iw, ih = ix1 - ix0, iy1 - iy0
+    if iw <= 1 or ih <= 1:
+        return None
+    icx, icy = (ix0 + ix1) / 2.0, (iy0 + iy1) / 2.0
+
+    try:
+        drawings = page.get_drawings(extended=True)
+    except TypeError:
+        return None
+    except Exception:
+        return None
+
+    best = None
+    for d in drawings:
+        if d.get("type") != "clip":
+            continue
+        # curves ('c') mark a rounded clip; purely rectangular clips are 're'
+        if not any(it and it[0] == "c" for it in d.get("items", [])):
+            continue
+        r = d.get("rect") or d.get("scissor")
+        if r is None:
+            continue
+        r = fitz.Rect(r)
+        cw, ch = r.width, r.height
+        if cw <= 1 or ch <= 1:
+            continue
+        # concentric with the placement, and not bigger than it (skip the ring)
+        if abs((r.x0 + r.x1) / 2.0 - icx) > 4.0 or abs((r.y0 + r.y1) / 2.0 - icy) > 4.0:
+            continue
+        if cw > iw * 1.02 or ch > ih * 1.02:
+            continue
+        area = cw * ch
+        if best is None or area > best[0]:
+            best = (area, r)
+
+    if best is None:
+        return None
+    r = best[1]
+    return (
+        ((r.x0 + r.x1) / 2.0 - ix0) / iw,
+        ((r.y0 + r.y1) / 2.0 - iy0) / ih,
+        (r.width / 2.0) / iw,
+        (r.height / 2.0) / ih,
+    )
+
+
+def _bake_ellipse_alpha(path: str, frac: tuple) -> None:
+    """Punch an elliptical alpha hole into the PNG at `path` (in place), so the
+    saved raster is transparent outside the detected circular clip."""
+    if Image is None or ImageDraw is None:
+        return
+    try:
+        img = Image.open(path).convert("RGBA")
+        w, h = img.size
+        fcx, fcy, frx, fry = frac
+        cx, cy, rx, ry = fcx * w, fcy * h, frx * w, fry * h
+        mask = Image.new("L", (w, h), 0)
+        ImageDraw.Draw(mask).ellipse([cx - rx, cy - ry, cx + rx, cy + ry], fill=255)
+        img.putalpha(mask)
+        img.save(path)
+    except Exception:
+        # leave the rectangular raster as-is if masking fails
+        pass
 
 
 def extract_images(src_pdf: str, page: int, dpi: int, out_dir: str) -> List[Dict[str, Any]]:
@@ -54,6 +133,9 @@ def extract_images(src_pdf: str, page: int, dpi: int, out_dir: str) -> List[Dict
             if w <= 1 or h <= 1:
                 continue
 
+            # circular/elliptical clip applied to this placement, if any
+            clip_frac = _detect_circular_clip(pg, bbox)
+
             name = f"p{page}_x{xref}.png"
             path = os.path.join(out_dir, name)
             if not os.path.exists(path):
@@ -62,8 +144,29 @@ def extract_images(src_pdf: str, page: int, dpi: int, out_dir: str) -> List[Dict
                     # CMYK / other multi-channel -> convert to RGB before PNG save
                     if pix.n - pix.alpha >= 4:
                         pix = fitz.Pixmap(fitz.csRGB, pix)
+
+                    # Apply the image's soft-mask (alpha channel) if present, so
+                    # circular / feathered / transparent clips survive instead of
+                    # being flattened to an opaque rectangle. The smask is a
+                    # separate grayscale xref referenced by the base image.
+                    try:
+                        smask = int(doc.extract_image(xref).get("smask", 0) or 0)
+                    except Exception:
+                        smask = 0
+                    if smask > 0:
+                        try:
+                            mask = fitz.Pixmap(doc, smask)
+                            pix = fitz.Pixmap(pix, mask)
+                        except Exception:
+                            pass
+
                     pix.save(path)
                     pix = None
+
+                    # Re-apply the vector circle as raster alpha so the extracted
+                    # object matches the page (and re-inserts round on export).
+                    if clip_frac is not None:
+                        _bake_ellipse_alpha(path, clip_frac)
                 except Exception:
                     continue
 
