@@ -61,6 +61,7 @@ _COL_TOL = 3.0        # max left-edge drift for two lines to share a column
 _SIZE_TOL = 1.5       # max font-size difference to treat lines as one paragraph
 _GAP_FACTOR = 0.8     # max blank vertical gap as a fraction of the line's size
 _OVERLAP_FACTOR = 0.4  # allow slight bbox overlap between stacked lines
+_COL_GAP_FACTOR = 4.0  # horizontal gap (in font sizes) that marks a column break
 
 
 def extract_text_blocks(src_pdf: str, page: int, dpi: int = 144) -> List[Dict[str, Any]]:
@@ -98,16 +99,6 @@ def extract_text_blocks(src_pdf: str, page: int, dpi: int = 144) -> List[Dict[st
             if blk.get("type", 0) != 0:
                 continue
 
-            bx0 = by0 = float("inf")
-            bx1 = by1 = float("-inf")
-
-            # char-count-weighted tallies for the dominant style of the block
-            size_w: Dict[float, float] = {}
-            font_w: Dict[str, float] = {}
-            bold_w: Dict[bool, float] = {}
-            italic_w: Dict[bool, float] = {}
-            color_w: Dict[str, float] = {}
-
             # collect every span with its style, grouped by the PyMuPDF line it
             # came from (a row *candidate*); rows are merged by baseline below.
             row_cands: List[Dict[str, Any]] = []
@@ -121,41 +112,25 @@ def extract_text_blocks(src_pdf: str, page: int, dpi: int = 144) -> List[Dict[st
                         continue
 
                     x0, y0, x1, y1 = span.get("bbox", (0.0, 0.0, 0.0, 0.0))
-                    bx0 = min(bx0, x0)
-                    by0 = min(by0, y0)
-                    bx1 = max(bx1, x1)
-                    by1 = max(by1, y1)
                     ly0 = min(ly0, y0)
                     ly1 = max(ly1, y1)
-
-                    weight = float(len(text.strip())) or 1.0
-                    ssize = round(float(span.get("size", 12.0)), 2)
-                    fname = str(span.get("font", "Helvetica"))
-                    is_bold = _span_bold(span)
-                    is_italic = _span_italic(span)
-                    chex = _color_to_hex(span.get("color"))
-                    size_w[ssize] = size_w.get(ssize, 0.0) + weight
-                    font_w[fname] = font_w.get(fname, 0.0) + weight
-                    bold_w[is_bold] = bold_w.get(is_bold, 0.0) + weight
-                    italic_w[is_italic] = italic_w.get(is_italic, 0.0) + weight
-                    color_w[chex] = color_w.get(chex, 0.0) + weight
 
                     sps.append(
                         {
                             "text": text,
                             "x0": x0,
                             "x1": x1,
-                            "size": ssize,
-                            "font": fname,
-                            "bold": is_bold,
-                            "italic": is_italic,
-                            "color": chex,
+                            "size": round(float(span.get("size", 12.0)), 2),
+                            "font": str(span.get("font", "Helvetica")),
+                            "bold": _span_bold(span),
+                            "italic": _span_italic(span),
+                            "color": _color_to_hex(span.get("color")),
                         }
                     )
                 if sps:
                     row_cands.append({"y0": ly0, "y1": ly1, "spans": sps})
 
-            if not row_cands or bx0 == float("inf"):
+            if not row_cands:
                 continue
 
             # merge candidates whose vertical extents overlap into one visual row
@@ -176,58 +151,127 @@ def extract_text_blocks(src_pdf: str, page: int, dpi: int = 144) -> List[Dict[st
                     dst["y0"] = min(dst["y0"], rc["y0"])
                     dst["y1"] = max(dst["y1"], rc["y1"])
 
-            # one text line + per-span style runs per row, ordered left-to-right
-            lines: List[Dict[str, Any]] = []
-            for row in sorted(rows, key=lambda r: r["y0"]):
-                cur = ""
-                runs: List[Dict[str, Any]] = []
+            # split each visual row into column segments wherever a wide
+            # horizontal gap separates neighbouring spans. A two-column layout
+            # (e.g. a left-column URL and a right-column line sharing a baseline)
+            # must not collapse into one line, while a title spanning a single
+            # row ("MARHARYTA … KUBAI", gap ~3x font) stays together.
+            segments: List[Dict[str, Any]] = []
+            for row in rows:
+                group: List[Dict[str, Any]] = []
                 prev_x1 = None
                 for s in sorted(row["spans"], key=lambda s: s["x0"]):
-                    seg = s["text"]
-                    # bridge a horizontal gap between merged pieces with a space
                     if (
                         prev_x1 is not None
-                        and s["x0"] - prev_x1 > 0.3 * s["size"]
-                        and not cur.endswith(" ")
-                        and not seg.startswith(" ")
+                        and s["x0"] - prev_x1 > _COL_GAP_FACTOR * s["size"]
+                        and group
                     ):
-                        cur += " "
-                        runs.append({"n": 1, "bold": s["bold"], "italic": s["italic"],
-                                     "color": s["color"], "size": s["size"], "font": s["font"]})
-                    cur += seg
-                    runs.append({"n": len(seg), "bold": s["bold"], "italic": s["italic"],
-                                 "color": s["color"], "size": s["size"], "font": s["font"]})
+                        segments.append({"y0": row["y0"], "y1": row["y1"], "spans": group})
+                        group = []
+                    group.append(s)
                     prev_x1 = s["x1"]
+                if group:
+                    segments.append({"y0": row["y0"], "y1": row["y1"], "spans": group})
 
-                # rstrip trailing whitespace, trimming run lengths to stay aligned
-                trim = len(cur) - len(cur.rstrip())
-                cur = cur.rstrip()
-                while trim > 0 and runs:
-                    if runs[-1]["n"] <= trim:
-                        trim -= runs.pop()["n"]
-                    else:
-                        runs[-1]["n"] -= trim
-                        trim = 0
-                if cur:
-                    lines.append({"text": cur, "runs": runs})
+            # cluster segments into columns by horizontal overlap / left edge, so
+            # each column becomes its own block with its own x-origin.
+            columns: List[Dict[str, Any]] = []
+            for seg in sorted(
+                segments, key=lambda g: (g["y0"], min(s["x0"] for s in g["spans"]))
+            ):
+                sx0 = min(s["x0"] for s in seg["spans"])
+                sx1 = max(s["x1"] for s in seg["spans"])
+                dst = None
+                best = 0.0
+                for col in columns:
+                    overlap = min(col["x1"], sx1) - max(col["x0"], sx0)
+                    if overlap > best:
+                        best = overlap
+                        dst = col
+                if dst is None:
+                    for col in columns:
+                        if abs(col["x0"] - sx0) <= _COL_TOL:
+                            dst = col
+                            break
+                if dst is None:
+                    columns.append({"x0": sx0, "x1": sx1, "segs": [seg]})
+                else:
+                    dst["x0"] = min(dst["x0"], sx0)
+                    dst["x1"] = max(dst["x1"], sx1)
+                    dst["segs"].append(seg)
 
-            if not lines:
-                continue
+            # one raw record per column: its rows stacked as lines with per-span
+            # style runs, plus char-weighted style tallies for the dominant look.
+            for col in sorted(columns, key=lambda c: c["x0"]):
+                lines: List[Dict[str, Any]] = []
+                cx0 = cy0 = float("inf")
+                cx1 = cy1 = float("-inf")
+                size_w: Dict[float, float] = {}
+                font_w: Dict[str, float] = {}
+                bold_w: Dict[bool, float] = {}
+                italic_w: Dict[bool, float] = {}
+                color_w: Dict[str, float] = {}
+                for seg in sorted(col["segs"], key=lambda g: g["y0"]):
+                    cur = ""
+                    runs: List[Dict[str, Any]] = []
+                    prev_x1 = None
+                    for s in sorted(seg["spans"], key=lambda s: s["x0"]):
+                        piece = s["text"]
+                        # bridge an ordinary word-space gap between merged pieces
+                        if (
+                            prev_x1 is not None
+                            and s["x0"] - prev_x1 > 0.3 * s["size"]
+                            and not cur.endswith(" ")
+                            and not piece.startswith(" ")
+                        ):
+                            cur += " "
+                            runs.append({"n": 1, "bold": s["bold"], "italic": s["italic"],
+                                         "color": s["color"], "size": s["size"], "font": s["font"]})
+                        cur += piece
+                        runs.append({"n": len(piece), "bold": s["bold"], "italic": s["italic"],
+                                     "color": s["color"], "size": s["size"], "font": s["font"]})
+                        prev_x1 = s["x1"]
 
-            raw.append(
-                {
-                    "lines": lines,
-                    "x0": bx0,
-                    "y0": by0,
-                    "x1": bx1,
-                    "y1": by1,
-                    "size_w": size_w,
-                    "font_w": font_w,
-                    "bold_w": bold_w,
-                    "italic_w": italic_w,
-                    "color_w": color_w,
-                }
-            )
+                        cx0 = min(cx0, s["x0"])
+                        cx1 = max(cx1, s["x1"])
+                        cy0 = min(cy0, seg["y0"])
+                        cy1 = max(cy1, seg["y1"])
+                        w = float(len(s["text"].strip())) or 1.0
+                        size_w[s["size"]] = size_w.get(s["size"], 0.0) + w
+                        font_w[s["font"]] = font_w.get(s["font"], 0.0) + w
+                        bold_w[s["bold"]] = bold_w.get(s["bold"], 0.0) + w
+                        italic_w[s["italic"]] = italic_w.get(s["italic"], 0.0) + w
+                        color_w[s["color"]] = color_w.get(s["color"], 0.0) + w
+
+                    # rstrip trailing whitespace, trimming run lengths to stay aligned
+                    trim = len(cur) - len(cur.rstrip())
+                    cur = cur.rstrip()
+                    while trim > 0 and runs:
+                        if runs[-1]["n"] <= trim:
+                            trim -= runs.pop()["n"]
+                        else:
+                            runs[-1]["n"] -= trim
+                            trim = 0
+                    if cur:
+                        lines.append({"text": cur, "runs": runs})
+
+                if not lines or cx0 == float("inf"):
+                    continue
+
+                raw.append(
+                    {
+                        "lines": lines,
+                        "x0": cx0,
+                        "y0": cy0,
+                        "x1": cx1,
+                        "y1": cy1,
+                        "size_w": size_w,
+                        "font_w": font_w,
+                        "bold_w": bold_w,
+                        "italic_w": italic_w,
+                        "color_w": color_w,
+                    }
+                )
 
         # Phase 2: stitch stacked lines back into paragraphs. Two records join
         # when they share a left edge and font size and the vertical gap between
