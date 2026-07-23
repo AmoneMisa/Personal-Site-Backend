@@ -8,10 +8,9 @@ from typing import Any, Dict, List
 import fitz  # PyMuPDF (pulled in transitively by pdf2docx)
 
 try:
-    from PIL import Image, ImageDraw  # Pillow (declared in requirements)
+    from PIL import Image  # Pillow (declared in requirements)
 except Exception:  # pragma: no cover - Pillow is expected in the runtime image
     Image = None  # type: ignore
-    ImageDraw = None  # type: ignore
 
 
 def _detect_circular_clip(page: "fitz.Page", bbox) -> tuple | None:
@@ -71,25 +70,6 @@ def _detect_circular_clip(page: "fitz.Page", bbox) -> tuple | None:
         (r.width / 2.0) / iw,
         (r.height / 2.0) / ih,
     )
-
-
-def _bake_ellipse_alpha(path: str, frac: tuple) -> None:
-    """Punch an elliptical alpha hole into the PNG at `path` (in place), so the
-    saved raster is transparent outside the detected circular clip."""
-    if Image is None or ImageDraw is None:
-        return
-    try:
-        img = Image.open(path).convert("RGBA")
-        w, h = img.size
-        fcx, fcy, frx, fry = frac
-        cx, cy, rx, ry = fcx * w, fcy * h, frx * w, fry * h
-        mask = Image.new("L", (w, h), 0)
-        ImageDraw.Draw(mask).ellipse([cx - rx, cy - ry, cx + rx, cy + ry], fill=255)
-        img.putalpha(mask)
-        img.save(path)
-    except Exception:
-        # leave the rectangular raster as-is if masking fails
-        pass
 
 
 def extract_images(src_pdf: str, page: int, dpi: int, out_dir: str) -> List[Dict[str, Any]]:
@@ -162,24 +142,30 @@ def extract_images(src_pdf: str, page: int, dpi: int, out_dir: str) -> List[Dict
 
                     pix.save(path)
                     pix = None
-
-                    # Re-apply the vector circle as raster alpha so the extracted
-                    # object matches the page (and re-inserts round on export).
-                    if clip_frac is not None:
-                        _bake_ellipse_alpha(path, clip_frac)
                 except Exception:
                     continue
 
-            items.append(
-                {
-                    "id": f"img_{page}_{seq}",
-                    "name": name,
-                    "x": round(x0 * scale, 2),
-                    "y": round(y0 * scale, 2),
-                    "w": round(w * scale, 2),
-                    "h": round(h * scale, 2),
+            item: Dict[str, Any] = {
+                "id": f"img_{page}_{seq}",
+                "name": name,
+                "x": round(x0 * scale, 2),
+                "y": round(y0 * scale, 2),
+                "w": round(w * scale, 2),
+                "h": round(h * scale, 2),
+            }
+            # Non-destructive circular framing: report the clip as fractions of the
+            # image bbox so the frontend can render the photo round *in place* with
+            # a movable clip, yet reveal the full rectangle when it's dragged out of
+            # the circle. The saved PNG stays the full photo (no baked-in alpha).
+            if clip_frac is not None:
+                fcx, fcy, frx, fry = clip_frac
+                item["clip"] = {
+                    "cx": round(fcx, 4),
+                    "cy": round(fcy, 4),
+                    "rx": round(frx, 4),
+                    "ry": round(fry, 4),
                 }
-            )
+            items.append(item)
             seq += 1
 
         return items
