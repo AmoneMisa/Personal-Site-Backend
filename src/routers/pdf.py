@@ -24,6 +24,7 @@ from ..processors.pdf_background import render_background_png
 from ..processors.pdf_text import extract_text_blocks, extract_links
 from ..processors.pdf_textedit import apply_text_edits, apply_links
 from ..processors.pdf_image import extract_images, apply_image_edits
+from ..processors.pdf_pageops import add_design_page
 from ..utils.redis_client import get_redis
 
 try:
@@ -360,6 +361,33 @@ async def page_info(doc_id: str):
         w, h = _safe_page_box(reader.pages[0])
 
     return JSONResponse({"pages": pages, "pageW": w, "pageH": h})
+
+
+@router.post("/add-design-page/{doc_id}")
+async def add_design_page_route(doc_id: str):
+    """Append an empty themed page (reuses page 1's coloured columns, no avatar
+    or text). Existing pages are untouched, so their cached previews stay valid."""
+    r: Redis = get_redis()
+    await ensure_doc_exists(r, doc_id)
+
+    src = source_path(doc_id)
+    if not os.path.exists(src):
+        raise HTTPException(404, "Source PDF not found")
+
+    tmp = os.path.join(doc_folder(doc_id), "source_withpage.pdf")
+    try:
+        await run_in_threadpool(add_design_page, src, tmp, 0)
+        os.replace(tmp, src)
+    except Exception as e:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+        raise HTTPException(500, f"Failed to add page: {e}")
+
+    total = _safe_pdf_num_pages(src)
+    return JSONResponse({"pages": total, "page": total})
 
 
 @router.get("/preview/{doc_id}/{page}")
