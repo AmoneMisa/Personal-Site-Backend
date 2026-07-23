@@ -9,6 +9,23 @@ import fitz  # PyMuPDF (pulled in transitively by pdf2docx)
 _FLAG_ITALIC = 1 << 1  # 2
 _FLAG_BOLD = 1 << 4  # 16
 
+# Many PDFs encode weight/slant in the font name rather than the flags bitmask
+# (e.g. "Now-Black", "Aileron-Bold", "Lato-Italic"), so detect those too.
+_BOLD_NAMES = ("bold", "black", "heavy", "semibold", "demibold", "extrabold", "ultra")
+_ITALIC_NAMES = ("italic", "oblique")
+
+
+def _span_bold(span: Dict[str, Any]) -> bool:
+    if int(span.get("flags", 0)) & _FLAG_BOLD:
+        return True
+    return any(k in str(span.get("font", "")).lower() for k in _BOLD_NAMES)
+
+
+def _span_italic(span: Dict[str, Any]) -> bool:
+    if int(span.get("flags", 0)) & _FLAG_ITALIC:
+        return True
+    return any(k in str(span.get("font", "")).lower() for k in _ITALIC_NAMES)
+
 # Auto-link detection: bare URLs and e-mail addresses embedded as plain text.
 _URL_RE = re.compile(r"(https?://[^\s]+)", re.IGNORECASE)
 _EMAIL_RE = re.compile(r"([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})")
@@ -81,7 +98,6 @@ def extract_text_blocks(src_pdf: str, page: int, dpi: int = 144) -> List[Dict[st
             if blk.get("type", 0) != 0:
                 continue
 
-            line_texts: List[str] = []
             bx0 = by0 = float("inf")
             bx1 = by1 = float("-inf")
 
@@ -92,8 +108,13 @@ def extract_text_blocks(src_pdf: str, page: int, dpi: int = 144) -> List[Dict[st
             italic_w: Dict[bool, float] = {}
             color_w: Dict[str, float] = {}
 
+            # collect every span with its style, grouped by the PyMuPDF line it
+            # came from (a row *candidate*); rows are merged by baseline below.
+            row_cands: List[Dict[str, Any]] = []
             for line in blk.get("lines", []):
-                span_texts: List[str] = []
+                sps: List[Dict[str, Any]] = []
+                ly0 = float("inf")
+                ly1 = float("-inf")
                 for span in line.get("spans", []):
                     text = span.get("text") or ""
                     if not text.strip():
@@ -104,31 +125,98 @@ def extract_text_blocks(src_pdf: str, page: int, dpi: int = 144) -> List[Dict[st
                     by0 = min(by0, y0)
                     bx1 = max(bx1, x1)
                     by1 = max(by1, y1)
+                    ly0 = min(ly0, y0)
+                    ly1 = max(ly1, y1)
 
-                    flags = int(span.get("flags", 0))
                     weight = float(len(text.strip())) or 1.0
                     ssize = round(float(span.get("size", 12.0)), 2)
-                    size_w[ssize] = size_w.get(ssize, 0.0) + weight
                     fname = str(span.get("font", "Helvetica"))
-                    font_w[fname] = font_w.get(fname, 0.0) + weight
-                    is_bold = bool(flags & _FLAG_BOLD)
-                    bold_w[is_bold] = bold_w.get(is_bold, 0.0) + weight
-                    is_italic = bool(flags & _FLAG_ITALIC)
-                    italic_w[is_italic] = italic_w.get(is_italic, 0.0) + weight
+                    is_bold = _span_bold(span)
+                    is_italic = _span_italic(span)
                     chex = _color_to_hex(span.get("color"))
+                    size_w[ssize] = size_w.get(ssize, 0.0) + weight
+                    font_w[fname] = font_w.get(fname, 0.0) + weight
+                    bold_w[is_bold] = bold_w.get(is_bold, 0.0) + weight
+                    italic_w[is_italic] = italic_w.get(is_italic, 0.0) + weight
                     color_w[chex] = color_w.get(chex, 0.0) + weight
 
-                    span_texts.append(text)
+                    sps.append(
+                        {
+                            "text": text,
+                            "x0": x0,
+                            "x1": x1,
+                            "size": ssize,
+                            "font": fname,
+                            "bold": is_bold,
+                            "italic": is_italic,
+                            "color": chex,
+                        }
+                    )
+                if sps:
+                    row_cands.append({"y0": ly0, "y1": ly1, "spans": sps})
 
-                if span_texts:
-                    line_texts.append("".join(span_texts).rstrip())
+            if not row_cands or bx0 == float("inf"):
+                continue
 
-            if not line_texts or bx0 == float("inf"):
+            # merge candidates whose vertical extents overlap into one visual row
+            row_cands.sort(key=lambda r: r["y0"])
+            rows: List[Dict[str, Any]] = []
+            for rc in row_cands:
+                dst = None
+                for row in rows:
+                    ov = min(row["y1"], rc["y1"]) - max(row["y0"], rc["y0"])
+                    minh = min(row["y1"] - row["y0"], rc["y1"] - rc["y0"]) or 1.0
+                    if ov > 0.5 * minh:
+                        dst = row
+                        break
+                if dst is None:
+                    rows.append({"y0": rc["y0"], "y1": rc["y1"], "spans": list(rc["spans"])})
+                else:
+                    dst["spans"].extend(rc["spans"])
+                    dst["y0"] = min(dst["y0"], rc["y0"])
+                    dst["y1"] = max(dst["y1"], rc["y1"])
+
+            # one text line + per-span style runs per row, ordered left-to-right
+            lines: List[Dict[str, Any]] = []
+            for row in sorted(rows, key=lambda r: r["y0"]):
+                cur = ""
+                runs: List[Dict[str, Any]] = []
+                prev_x1 = None
+                for s in sorted(row["spans"], key=lambda s: s["x0"]):
+                    seg = s["text"]
+                    # bridge a horizontal gap between merged pieces with a space
+                    if (
+                        prev_x1 is not None
+                        and s["x0"] - prev_x1 > 0.3 * s["size"]
+                        and not cur.endswith(" ")
+                        and not seg.startswith(" ")
+                    ):
+                        cur += " "
+                        runs.append({"n": 1, "bold": s["bold"], "italic": s["italic"],
+                                     "color": s["color"], "size": s["size"], "font": s["font"]})
+                    cur += seg
+                    runs.append({"n": len(seg), "bold": s["bold"], "italic": s["italic"],
+                                 "color": s["color"], "size": s["size"], "font": s["font"]})
+                    prev_x1 = s["x1"]
+
+                # rstrip trailing whitespace, trimming run lengths to stay aligned
+                trim = len(cur) - len(cur.rstrip())
+                cur = cur.rstrip()
+                while trim > 0 and runs:
+                    if runs[-1]["n"] <= trim:
+                        trim -= runs.pop()["n"]
+                    else:
+                        runs[-1]["n"] -= trim
+                        trim = 0
+                if cur:
+                    lines.append({"text": cur, "runs": runs})
+
+            if not lines:
                 continue
 
             raw.append(
                 {
-                    "lines": line_texts,
+                    "lines": lines,
                     "x0": bx0,
                     "y0": by0,
                     "x1": bx1,
@@ -184,9 +272,27 @@ def extract_text_blocks(src_pdf: str, page: int, dpi: int = 144) -> List[Dict[st
 
         blocks: List[Dict[str, Any]] = []
         for seq, p in enumerate(merged):
-            text = "\n".join(p["lines"]).strip()
-            if not text:
+            lines = p["lines"]
+            text = "\n".join(ln["text"] for ln in lines)
+            if not text.strip():
                 continue
+            # per-line, per-span style runs so the frontend can rebuild Fabric's
+            # styles[line][char] map (bold surname next to a regular one, a bold
+            # word inside a sentence, an italic role line, etc.).
+            line_runs = [
+                [
+                    {
+                        "n": int(run["n"]),
+                        "bold": bool(run["bold"]),
+                        "italic": bool(run["italic"]),
+                        "color": run["color"],
+                        "fontSize": round(float(run["size"]) * scale, 2),
+                        "fontName": run["font"],
+                    }
+                    for run in ln["runs"]
+                ]
+                for ln in lines
+            ]
             blocks.append(
                 {
                     "id": f"blk_{page}_{seq}",
@@ -200,6 +306,7 @@ def extract_text_blocks(src_pdf: str, page: int, dpi: int = 144) -> List[Dict[st
                     "bold": bool(_dominant(p["bold_w"]) or False),
                     "italic": bool(_dominant(p["italic_w"]) or False),
                     "color": str(_dominant(p["color_w"]) or "#111111"),
+                    "lineRuns": line_runs,
                 }
             )
 
