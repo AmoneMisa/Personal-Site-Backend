@@ -5,9 +5,6 @@ services:
     restart: unless-stopped
     env_file:
       - ./db.env
-    depends_on:
-      redis:
-        condition: service_started
 
   frontend:
     build:
@@ -15,7 +12,6 @@ services:
     env_file:
       - ./db.env
     environment:
-      REDIS_URL: "redis://redis:6379"
       AI_WORKER_URL: "http://ai-worker:4030"
       # URL of the Telegram MTProto worker (on the dedicated VPS, via its tunnel).
       # Read from the deploy env/.env so the ephemeral tunnel URL isn't baked in;
@@ -29,16 +25,6 @@ services:
     networks:
       - default
       - ai-net
-
-  redis:
-    image: redis:8.4.0
-    restart: unless-stopped
-    command: [ "redis-server", "--appendonly", "yes" ]
-    volumes:
-      - redis_data:/data
-
-volumes:
-  redis_data:
 
 networks:
   ai-net:
